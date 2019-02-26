@@ -2,6 +2,7 @@
 
 (require racket/contract
          racket/generator
+         racket/generic
          data/heap
          data/queue
          math/distributions
@@ -17,9 +18,8 @@
                [wait (-> sim? number? event?)]
                [process (-> sim? (-> sim? (-> any)) event?)]
                [make-resource (-> sim? number? resource?)]
-               [request (-> resource? event?)]
-               [release (-> resource? event? any)])
- )
+               [request (-> resource? event:request?)]
+               [release (-> event:request? any)]))
 
 (struct sim ([time #:mutable] queue idgen) #:transparent)
 (struct schedule-entry (time id event) #:transparent)
@@ -27,35 +27,50 @@
 (define (make-sim)
   (define (event<=? x y)
     (and 
-     (<= (schedule-entry-time x) (schedule-entry-time y))
-     (<= (schedule-entry-id x) (schedule-entry-id y))))
+     (<= (event-scheduled x) (event-scheduled y))
+     (<= (event-id x) (event-id y))))
   (define idgen (generator ()
                            (let loop ([id 0])
                              (yield id)
                              (loop (add1 id)))))
   (sim 0 (make-heap event<=?) idgen))
 
-(struct event (sim [callbacks #:mutable] [completed? #:mutable]) #:transparent)
+(define-generics cancelable
+  (cancel cancelable))
+
+(struct event (sim [callbacks #:mutable] [completed? #:mutable] [scheduled #:mutable] [id #:mutable]) #:transparent)
 
 (define (make-event sim [callbacks '()])
-  (event sim callbacks #f))
+  (event sim callbacks #f #f #f))
 
 (define (add-callback! evt cb)
   (set-event-callbacks! evt (cons cb (event-callbacks evt))))
 
 (define (trigger! event [time #f])
-  (define sim (event-sim event))
-  (set! time (or time (sim-time sim)))
-  (heap-add! (sim-queue sim) (schedule-entry time ((sim-idgen sim)) event))
-  event)
+  (when (and (not (triggered? event)) (not (completed? event)))
+    (define sim (event-sim event))
+    (set! time (or time (sim-time sim)))
+    (set-event-scheduled! event (or time (sim-time sim)))
+    (set-event-id! event ((sim-idgen sim)))
+    (heap-add! (sim-queue sim) event)
+    event))
+
+(define (triggered? event)
+  (if (event-scheduled event) #t #f))
+
+(define completed? event-completed?)
+
+(define (cancel-event! event)
+  (when (and (triggered? event) (not (completed? event)))
+    (define sim (event-sim event))
+    (heap-remove! (sim-queue sim) event)))
 
 (define (step! sim)
   (define queue (sim-queue sim))
   (when (> (heap-count queue) 0)
-    (let* ([entry (heap-min queue)]
-           [evt (schedule-entry-event entry)]
+    (let* ([evt (heap-min queue)]
            [callbacks (event-callbacks evt)]
-           [new-time (schedule-entry-time entry)])
+           [new-time (event-scheduled evt)])
       (heap-remove-min! queue)
       (when (not (event-completed? evt))
         (set-sim-time! sim new-time)
@@ -89,13 +104,14 @@
   proc-evt)
 
 (struct resource (sim cap queue [users #:mutable]) #:transparent)
+(struct event:request event (resource))
 
 (define (make-resource sim cap)
   (resource sim cap (make-queue) '()))
 
 (define (request res)
   (define sim (resource-sim res))
-  (define put (make-event sim))
+  (define put (event:request sim '() #f #f #f res))
   (if (< (length (resource-users res)) (resource-cap res))
       (begin
         (set-resource-users! res (cons put (resource-users res)))
@@ -104,7 +120,8 @@
         (enqueue! (resource-queue res) put)
         put)))
 
-(define (release res req)
+(define (release req)
+  (define res (event:request-resource req))
   (define sim (resource-sim res))
   (if (memq req (resource-users res))
       (begin
@@ -114,6 +131,20 @@
           (set-resource-users! res (cons next (resource-users res)))
           (trigger! next)))
       (raise-argument-error 'request "Request is not in use by resource")))
+
+(define-syntax (with-resource stx)
+  (syntax-case stx ()
+    [(_ (req res) body ...) #'(let ([req (request res)])
+                                body ...
+                                (release req))]))
+
+(define-syntax (swap! stx)
+  (syntax-case stx ()
+    [(_ a b) #'(begin
+                 (define tmp #f)
+                 (set! tmp a)
+                 (set! a b)
+                 (set! b tmp))]))
 
 (define (any . evts)
   (define any-evt (make-event (event-sim (first evts))))
@@ -129,17 +160,26 @@
 
 (define mysim (make-sim))
 
-(define ((cust name) sim)
+;; (define ((cust name) sim)
+;;   (generator ()
+;;              (printf "~a entering @~a~%" name (sim-time sim))
+;;              (define req (request counter))
+;;              (yield req)
+;;              (printf "~a at the counter @~a~%" name (sim-time sim))
+;;              (yield (wait sim 5))
+;;              (release req)
+;;              (printf "~a leaving @~a~%" name (sim-time sim))))
+
+(define ((cust2 name) sim)
   (generator ()
              (printf "~a entering @~a~%" name (sim-time sim))
-             (define req (request counter))
-             (yield req)
-             (printf "~a at the counter @~a~%" name (sim-time sim))
-             (yield (wait sim 5))
-             (release counter req)
+             (with-resource [req counter]
+                   (yield req)
+                   (printf "~a at the counter @~a~%" name (sim-time sim))
+                   (yield (wait sim 5)))
              (printf "~a leaving @~a~%" name (sim-time sim))))
 
 (define counter (make-resource mysim 1))
 
-(define adam (process mysim (cust "Adam")))
-(define bob (process mysim (cust "Bob")))
+(define adam (process mysim (cust2 "Adam")))
+(define bob (process mysim (cust2 "Bob")))
