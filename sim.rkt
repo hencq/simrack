@@ -22,13 +22,13 @@
                [release (-> event:request? any)]))
 
 (struct sim ([time #:mutable] queue idgen) #:transparent)
-(struct schedule-entry (time id event) #:transparent)
 
 (define (make-sim)
   (define (event<=? x y)
-    (and 
+    (or
      (<= (event-scheduled x) (event-scheduled y))
-     (<= (event-id x) (event-id y))))
+     (and (= (event-scheduled x) (event-scheduled y))
+          (<= (event-id x) (event-id y)))))
   (define idgen (generator ()
                            (let loop ([id 0])
                              (yield id)
@@ -38,10 +38,10 @@
 (define-generics cancelable
   (cancel cancelable))
 
-(struct event (sim [callbacks #:mutable] [completed? #:mutable] [scheduled #:mutable] [id #:mutable]) #:transparent)
+(struct event (sim [callbacks #:mutable] [completed? #:mutable] [scheduled #:mutable] [id #:mutable] [value #:mutable]) #:transparent)
 
-(define (make-event sim [callbacks '()])
-  (event sim callbacks #f #f #f))
+(define (make-event sim [callbacks '()] #:value [val #f])
+  (event sim callbacks #f #f #f val))
 
 (define (add-callback! evt cb)
   (set-event-callbacks! evt (cons cb (event-callbacks evt))))
@@ -49,7 +49,6 @@
 (define (trigger! event [time #f])
   (when (and (not (triggered? event)) (not (completed? event)))
     (define sim (event-sim event))
-    (set! time (or time (sim-time sim)))
     (set-event-scheduled! event (or time (sim-time sim)))
     (set-event-id! event ((sim-idgen sim)))
     (heap-add! (sim-queue sim) event)
@@ -74,9 +73,9 @@
       (heap-remove-min! queue)
       (when (not (event-completed? evt))
         (set-sim-time! sim new-time)
+        (set-event-completed?! evt #t)
         (for ([cb callbacks])
-          (cb))
-        (set-event-completed?! evt #t)))))
+          (cb))))))
 
 (define (run! sim #:until [until #f])
   (let loop ()
@@ -87,21 +86,22 @@
               (step! sim)
               (loop))])))
 
-(define (wait sim delay)
+(define (wait sim delay #:value [val #f])
   (define cur-time (sim-time sim))
-  (define evt (make-event sim))
+  (define evt (make-event sim #:value val))
   (trigger! evt (+ cur-time delay)))
 
 (define (process sim fun)
   (define proc-evt (make-event sim))
   (define gen (fun sim))
+  (define res #f)
   (define (cb)
-    (define res (gen))
+    (set! res (if res (gen (event-value res)) (gen)))
     (if (event? res)
         (add-callback! res cb)
         (trigger! proc-evt)))
   (trigger! (make-event sim (list cb)))
-  proc-evt)
+  (void))
 
 (struct resource (sim cap queue [users #:mutable]) #:transparent)
 (struct event:request event (resource))
@@ -111,7 +111,7 @@
 
 (define (request res)
   (define sim (resource-sim res))
-  (define put (event:request sim '() #f #f #f res))
+  (define put (event:request sim '() #f #f #f #f res))
   (if (< (length (resource-users res)) (resource-cap res))
       (begin
         (set-resource-users! res (cons put (resource-users res)))
@@ -130,56 +130,55 @@
           (define next (dequeue! (resource-queue res)))
           (set-resource-users! res (cons next (resource-users res)))
           (trigger! next)))
-      (raise-argument-error 'request "Request is not in use by resource")))
+      (error  "Request is not in use by resource" req)))
+
+(define (cancel-request! req)
+  (define res (event:request-resource req))
+  (queue-filter! (resource-queue res) (lambda (r)
+                       (not (eq? r req)))))
 
 (define-syntax (with-resource stx)
   (syntax-case stx ()
-    [(_ (req res) body ...) #'(let ([req (request res)])
+    [(_ (req exp) body ...) #'(let ([req exp])
                                 body ...
-                                (release req))]))
+                                (with-handlers
+                                  ([exn:fail? (lambda (e) (cancel-request! req))])
+                                  (release req)))]))
 
-(define-syntax (swap! stx)
-  (syntax-case stx ()
-    [(_ a b) #'(begin
-                 (define tmp #f)
-                 (set! tmp a)
-                 (set! a b)
-                 (set! b tmp))]))
 
 (define (any . evts)
-  (define any-evt (make-event (event-sim (first evts))))
-  (define done? #f)
-  (define (cb)
-    (when (not done?)
-      (set! done? #t)
-      (trigger! any-evt)))
+  (define any-evt (make-event (event-sim (first evts)) #:value '()))
+  (define ((cb evt))
+    (set-event-value! any-evt (cons evt (event-value any-evt)))
+    (trigger! any-evt))
   (for ([e evts])
-    (add-callback! e cb))
+    (add-callback! e (cb e)))
   any-evt)
 
 
 (define mysim (make-sim))
 
-;; (define ((cust name) sim)
-;;   (generator ()
-;;              (printf "~a entering @~a~%" name (sim-time sim))
-;;              (define req (request counter))
-;;              (yield req)
-;;              (printf "~a at the counter @~a~%" name (sim-time sim))
-;;              (yield (wait sim 5))
-;;              (release req)
-;;              (printf "~a leaving @~a~%" name (sim-time sim))))
-
-(define ((cust2 name) sim)
+(define ((cust name) sim)
   (generator ()
              (printf "~a entering @~a~%" name (sim-time sim))
-             (with-resource [req counter]
-                   (yield req)
-                   (printf "~a at the counter @~a~%" name (sim-time sim))
-                   (yield (wait sim 5)))
+             (with-resource [req (request counter)]
+               (define result (yield (any req (wait sim 3))))
+               (if (memq req result)
+                   (begin 
+                     (printf "~a at the counter @~a~%" name (sim-time sim))
+                     (yield (wait sim 5))
+                     (printf "~a is done @~a~%" name (sim-time sim)))
+                   (printf "~a lost patience @~a~%" name (sim-time sim))))
              (printf "~a leaving @~a~%" name (sim-time sim))))
 
 (define counter (make-resource mysim 1))
 
-(define adam (process mysim (cust2 "Adam")))
-(define bob (process mysim (cust2 "Bob")))
+(define (source sim)
+  (generator ()
+             (process sim (cust "Adam"))
+             (yield (wait sim 1))
+             (process sim (cust "Bob"))
+             (yield (wait sim 6))
+             (process sim (cust "Charlie"))))
+
+(process mysim source)
