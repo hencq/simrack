@@ -38,10 +38,13 @@
 (define (ready-tasks net)
   (filter ready? (Net-tasks net)))
 
+(define sim-time (make-parameter 0))
+
 (define (activate! net task)
   (define tokens (for/list ([p (in-list (Task-in task))])
                    (pop-token! p)))
-  (define results (apply (Task-fn task) tokens))
+  (define results (parameterize ((sim-time (Net-time net)))
+                    (apply (Task-fn task) tokens)))
   (for ([r results])
     (define t (+ (Net-time net) (car r)))
     (heap-add! (Net-queue net) (cons t (cdr r)))))
@@ -66,20 +69,6 @@
     (next-event! net))
   (activate-all! net))
 
-;; (define n
-;;   (letrec ([A (Place (make-queue))]
-;;            [B (Place (make-queue))]
-;;            [C (Place (make-queue))]
-;;            [t1 (Task (list A B) (lambda (t a b)
-;;                                   (printf "Running t1 @ ~a~%" t)
-;;                                   (list (list 5 A 'a) (list 5 B 'b))))]
-;;            [t2 (Task (list A) (lambda (t a)
-;;                                 (printf "Running t2 @ ~a~%" t)
-;;                                 (list (list 6 A 'a))))])
-;;     (push-token! A 'a1)
-;;     (push-token! A 'a2)
-;;     (push-token! B 'b1)
-;;     (Net (list A B C) (list t1 t2) (make-heap (lambda (x y) (<= (car x) (car y)))) 0)))
 
 (define-syntax (petri-net stx)
   (syntax-parse stx
@@ -109,10 +98,10 @@
            (place B 'b)
            (task t1 ((a A)
                      (b B))
-                 (displayln "Foo")
+                 (printf "t1 @ ~a~%" (sim-time))
                  (list (list 5 A 'a) (list 5 B 'b)))
            (task t2 ((a A))
-                 (displayln "Bar")
+                 (printf "t2 @ ~a~%" (sim-time))
                  (list (list 6 A 'a)))))
 
 
